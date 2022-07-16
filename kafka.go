@@ -1,9 +1,11 @@
 package kafka
 
 import (
+	"encoding"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	goqueue "github.com/antonio-alexander/go-queue"
 	finite "github.com/antonio-alexander/go-queue/finite"
@@ -18,6 +20,7 @@ type kafkaQueue struct {
 	sync.RWMutex
 	sync.WaitGroup
 	started  bool
+	offset   int64
 	stopper  chan struct{}
 	config   Configuration
 	client   sarama.Client
@@ -85,6 +88,7 @@ func (k *kafkaQueue) Start(config *Configuration) error {
 	if err != nil {
 		return err
 	}
+	k.offset = 0
 	k.client = client
 	k.producer = producer
 	k.consumer = consumer
@@ -122,29 +126,79 @@ func (k *kafkaQueue) Close() {
 }
 
 func (k *kafkaQueue) Dequeue() (item interface{}, underflow bool) {
+	k.RLock()
+	defer k.RUnlock()
+
+	partitions, err := k.consumer.Partitions(k.config.KafkaTopic)
+	if err != nil {
+		return nil, true
+	}
+	for _, p := range partitions {
+		//REVIEW, do we have to store the offset?
+		consumer, err := k.consumer.ConsumePartition(k.config.KafkaTopic, p, k.offset)
+		if err != nil {
+			//TODO: print error
+			return nil, true
+		}
+		for m := range consumer.Messages() {
+			//REVIEW: how do we make this only execute once...performantly
+			item = m.Value
+			k.offset++
+			consumer.AsyncClose()
+		}
+	}
+
 	return
 }
 
 func (k *kafkaQueue) DequeueMultiple(n int) (items []interface{}) {
-	return
+	return nil
 }
 
 func (k *kafkaQueue) Flush() (items []interface{}) {
-	return
+	return nil
 }
 
 func (k *kafkaQueue) Enqueue(item interface{}) (overflow bool) {
+	k.RLock()
+	defer k.RUnlock()
+
+	message := &sarama.ProducerMessage{
+		Topic:     k.config.KafkaTopic,
+		Key:       nil,
+		Headers:   []sarama.RecordHeader{},
+		Metadata:  nil,
+		Offset:    0,
+		Partition: 0,
+		Timestamp: time.Now(),
+	}
+	switch v := item.(type) {
+	default:
+		return true
+	case encoding.BinaryMarshaler:
+		bytes, err := v.MarshalBinary()
+		if err != nil {
+			//TODO: log error
+			return true
+		}
+		message.Value = sarama.ByteEncoder(bytes)
+	case []byte:
+		message.Value = sarama.ByteEncoder(v)
+	}
+	if _, _, err := k.producer.SendMessage(message); err != nil {
+		return true
+	}
 	return
 }
 
 func (k *kafkaQueue) EnqueueMultiple(items []interface{}) (itemsRemaining []interface{}, overflow bool) {
-	return
+	return nil, true
 }
 
 func (k *kafkaQueue) Length() (size int) {
-	return
+	return -1
 }
 
 func (k *kafkaQueue) Capacity() (capacity int) {
-	return
+	return -1
 }

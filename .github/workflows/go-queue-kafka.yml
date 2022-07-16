@@ -1,0 +1,181 @@
+name: go-queue-kafka
+
+on:
+  push:
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v2
+      - name: Get version
+        run: |
+          version=`cat /home/runner/work/go-queue-kafka/go-queue-kafka/version.json | jq '.Version' | sed 's/"//g'`
+          echo $version
+          echo "version=$version" >> $GITHUB_ENV
+      - name: Generate build artifacts
+        run: |
+          mkdir -p /tmp
+          echo ${{ env.version }} >> /tmp/version
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: artifacts
+          path: |
+            /tmp/version
+
+  go_lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v3
+        with:
+          go-version: 1.16
+      - uses: actions/checkout@v3
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: v1.44.2
+          working-directory: .
+          args: --verbose
+
+  proto_lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v3
+        with:
+          go-version: 1.16
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Lint Protos
+        uses: yoheimuta/action-protolint@v1
+        with:
+          # github_token: ${{ secrets.GITHUB_TOKEN }}
+          level: error
+          protolint_version: "0.38.3"
+          protolint_flags: ./protos/go_queue_kafka.proto
+
+  proto_validate:
+    needs: [proto_lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.16
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          version: "3.20.1"
+      - name: Install protoc-gen-go
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.0
+      - name: Checkout repository code
+        uses: actions/checkout@v2
+      - name: Build protos
+        working-directory: /home/runner/work/go-queue-kafka/go-queue-kafka
+        run: |
+          protoc -I="./protos" --go_opt=paths=source_relative --go_out="/tmp" ./protos/go_queue_kafka.proto
+      - name: Compare protos
+        working-directory: /home/runner/work/go-queue-kafka/go-queue-kafka
+        run: |
+          if cmp --silent -- "./protos/go_queue_kafka.pb.go" "/tmp/go_queue_kafka.pb.go"; then
+            echo "generated proto files are identical"
+          else
+            echo "one or more proto files generated don't match"
+            exit 1
+          fi
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: artifacts
+          path: |
+            /tmp/go_queue_kafka.pb.go
+
+  go_test:
+    needs: [go_lint, proto_validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v2
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.16
+      - name: Docker Start
+        run: |
+          docker compose up -d
+      - name: Test Durostore
+        run: |
+          cd /home/runner/work/go-queue-kafka/go-queue-kafka
+          go mod download
+          go test -v ./... -coverprofile /tmp/go-queue-kafka.out | tee /tmp/go-queue-kafka.log
+      - name: Docker Clean-up
+        run: |
+          docker compose down
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: artifacts
+          path: |
+            /tmp/go-queue-kafka.log
+            /tmp/go-queue-kafka.out
+
+  git_validate_tag:
+    needs: [environment]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: artifacts
+          path: /tmp
+      - name: Get Environment
+        run: |
+          version=`cat /tmp/version`
+          echo "version=$version" >> $GITHUB_ENV
+      - name: Check out repository code
+        uses: actions/checkout@v2
+      - name: Validate Version
+        working-directory: /home/runner/work/go-queue-kafka/go-queue-kafka
+        run: |
+          git fetch --tags
+          echo checking for tag v$version
+          tag=`git tag --list v$version`
+          if [ -z "$tag" ]
+          then
+                echo "tag v$version doesn't exist"
+          else
+                echo "tag v$version exists"
+                exit 1
+          fi
+
+  git_push_tag:
+    needs: [go_test, git_validate_tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: artifacts
+          path: /tmp
+      - name: Get environment
+        run: |
+          version=`cat /tmp/version`
+          echo "version=$version" >> $GITHUB_ENV
+      - name: Check out repository code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: "0"
+      - name: Push/Update version
+        uses: anothrNick/github-tag-action@1.36.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: true
+          CUSTOM_TAG: v${{ env.version }}

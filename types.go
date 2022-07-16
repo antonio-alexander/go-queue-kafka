@@ -22,3 +22,8 @@ type Owner interface {
 	Start(config *Configuration) (err error)
 	Stop()
 }
+
+type Wrapper struct {
+	Type  string `json:"type,omitempty"`
+	Bytes []byte `json:"bytes"`
+}

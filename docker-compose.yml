@@ -16,6 +16,9 @@ services:
     image: confluentinc/cp-kafka:5.5.1
     hostname: kafka
     container_name: kafka
+    depends_on:
+      zoo:
+        condition: service_started
     ports:
       - "9092:9092"
     healthcheck:
@@ -24,8 +27,8 @@ services:
           "CMD-SHELL",
           "kafka-topics --bootstrap-server 127.0.0.1:9092 --list"
         ]
-      interval: 5s
-      timeout: 2s
+      interval: 30s
+      timeout: 2m
       retries: 10
     environment:
       KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092
@@ -35,5 +38,3 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-    depends_on:
-      - zoo
