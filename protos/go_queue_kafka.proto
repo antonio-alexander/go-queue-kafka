@@ -19,4 +19,9 @@ message Wrapper {
     // payload describes the payload as protobuf.any
     google.protobuf.Any payload = 2;
 }
-  
+
+// Bytes makes it easier to provide
+message Bytes {
+    // bytes describes the payload
+    bytes bytes = 1;
+}

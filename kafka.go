@@ -1,9 +1,8 @@
 package kafka
 
 import (
+	"context"
 	"encoding"
-	"errors"
-	"fmt"
 	"sync"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	finite "github.com/antonio-alexander/go-queue/finite"
 
 	"github.com/Shopify/sarama"
+	"github.com/pkg/errors"
 )
 
 //TODO: this should start somewhere simple, at a high level I want a
@@ -19,54 +19,114 @@ import (
 type kafkaQueue struct {
 	sync.RWMutex
 	sync.WaitGroup
-	started  bool
-	offset   int64
-	stopper  chan struct{}
-	config   Configuration
-	client   sarama.Client
-	producer sarama.SyncProducer
-	consumer sarama.Consumer
-	queue    interface {
+	started       bool
+	stopper       chan struct{}
+	config        Configuration
+	client        sarama.Client
+	producer      sarama.SyncProducer
+	consumerGroup sarama.ConsumerGroup
+	errorHandler  ErrorHandlerFx
+	queue         interface {
 		goqueue.Dequeuer
 		goqueue.EnqueueInFronter
 		finite.EnqueueLossy
 		goqueue.Enqueuer
 		goqueue.Event
 		goqueue.GarbageCollecter
-		goqueue.Info
+		goqueue.Length
 		goqueue.Owner
 		goqueue.Peeker
 		finite.Resizer
 	}
 }
 
+var _ sarama.ConsumerGroupHandler = &kafkaQueue{}
+
 func New(parameters ...interface{}) interface {
 	goqueue.Dequeuer
 	goqueue.Enqueuer
 	//REVIEW: do we want to implement events?
 	// goqueue.Event
-	goqueue.Info
+	goqueue.Length
+	goqueue.Owner
 	Owner
 } {
-	k := &kafkaQueue{
-		config: Configuration{
-			KafkaTopic:    defaultKafkaTopic,
-			KafkaHost:     defaultKafkaHost,
-			KafkaPort:     defaultKafkaPort,
-			KafkaClientID: defaultKafkaClientID,
-			QueueSize:     defaultQueueSize,
-		},
-	}
+	var config *Configuration
+
+	k := &kafkaQueue{}
 	for _, p := range parameters {
 		switch v := p.(type) {
-		case Configuration:
-			k.config = v
+		case ErrorHandlerFx:
+			k.errorHandler = v
+		case *Configuration:
+			config = v
+		}
+	}
+	if config != nil {
+		if err := k.Initialize(config); err != nil {
+			panic(err)
 		}
 	}
 	return k
 }
 
-func (k *kafkaQueue) Start(config *Configuration) error {
+func (k *kafkaQueue) error(err error) {
+	if err == nil {
+		return
+	}
+	if errorHandler := k.errorHandler; errorHandler != nil {
+		errorHandler(err)
+	}
+}
+
+func (k *kafkaQueue) launchConsume(consumerGroup sarama.ConsumerGroup, stopper chan struct{}) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	k.Add(1)
+	go func() {
+		defer k.Done()
+
+		select {
+		case <-stopper:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	chErr := make(chan error)
+	k.Add(1)
+	go func() {
+		defer k.Done()
+		if err := consumerGroup.Consume(ctx, []string{k.config.TopicIn}, k); err != nil {
+			cancel()
+			chErr <- err
+		}
+	}()
+	select {
+	case <-time.After(time.Second):
+		return nil
+	case err := <-chErr:
+		return err
+	}
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim.
+func (k *kafkaQueue) Setup(sarama.ConsumerGroupSession) error { return nil }
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+// but before the offsets are committed for the very last time.
+func (k *kafkaQueue) Cleanup(sarama.ConsumerGroupSession) error { return nil }
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+// Once the Messages() channel is closed, the Handler must finish its processing
+// loop and exit.
+func (k *kafkaQueue) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for msg := range claim.Messages() {
+		session.MarkMessage(msg, "")
+		MustEnqueue(k.queue, msg.Value)
+	}
+	return nil
+}
+
+func (k *kafkaQueue) Initialize(config *Configuration) error {
 	k.Lock()
 	defer k.Unlock()
 	if k.started {
@@ -75,102 +135,84 @@ func (k *kafkaQueue) Start(config *Configuration) error {
 	if config != nil {
 		k.config = *config
 	}
-	client, err := createKafkaClient(k.config)
+	client, err := CreateKafkaClient(k.config)
 	if err != nil {
 		return err
 	}
-	//REVIEW: do we need a sync producer?
 	producer, err := sarama.NewSyncProducerFromClient(client)
 	if err != nil {
 		return err
 	}
-	consumer, err := sarama.NewConsumerFromClient(client)
+	consumerGroup, err := sarama.NewConsumerGroupFromClient(k.config.GroupID, client)
 	if err != nil {
 		return err
 	}
-	k.offset = 0
+	if k.queue == nil {
+		k.queue = finite.New(k.config.QueueSize)
+	}
+	stopper := make(chan struct{})
+	if err := k.launchConsume(consumerGroup, stopper); err != nil {
+		return err
+	}
 	k.client = client
 	k.producer = producer
-	k.consumer = consumer
-	k.queue = finite.New(k.config.QueueSize)
-	k.stopper = make(chan struct{})
+	k.consumerGroup = consumerGroup
+	k.stopper = stopper
 	k.started = true
+	// k.launchPartitions()
 	return nil
 }
 
-func (k *kafkaQueue) Stop() {
+func (k *kafkaQueue) Shutdown() []interface{} {
 	k.Lock()
 	defer k.Unlock()
 	if !k.started {
-		return
+		return nil
 	}
 	close(k.stopper)
 	k.Wait()
-	if err := k.consumer.Close(); err != nil {
-		fmt.Println(err)
+	items := k.queue.Close()
+	if err := k.consumerGroup.Close(); err != nil {
+		k.error(err)
 	}
 	if err := k.producer.Close(); err != nil {
-		fmt.Println(err)
+		k.error(err)
 	}
 	if err := k.client.Close(); err != nil {
-		fmt.Println(err)
+		k.error(err)
 	}
-	k.consumer, k.producer, k.client = nil, nil, nil
+	k.consumerGroup, k.producer, k.client = nil, nil, nil
+	k.queue = nil
 	k.started = false
+	return items
 }
 
-func (k *kafkaQueue) Close() {
-	k.Lock()
-	defer k.Unlock()
-	k.queue.Close()
+func (k *kafkaQueue) Close() []interface{} {
+	return k.Shutdown()
 }
 
-func (k *kafkaQueue) Dequeue() (item interface{}, underflow bool) {
+func (k *kafkaQueue) Dequeue() (interface{}, bool) {
 	k.RLock()
 	defer k.RUnlock()
-
-	partitions, err := k.consumer.Partitions(k.config.KafkaTopic)
-	if err != nil {
-		return nil, true
-	}
-	for _, p := range partitions {
-		//REVIEW, do we have to store the offset?
-		consumer, err := k.consumer.ConsumePartition(k.config.KafkaTopic, p, k.offset)
-		if err != nil {
-			//TODO: print error
-			return nil, true
-		}
-		for m := range consumer.Messages() {
-			//REVIEW: how do we make this only execute once...performantly
-			item = m.Value
-			k.offset++
-			consumer.AsyncClose()
-		}
-	}
-
-	return
+	return k.queue.Dequeue()
 }
 
-func (k *kafkaQueue) DequeueMultiple(n int) (items []interface{}) {
-	return nil
+func (k *kafkaQueue) DequeueMultiple(n int) []interface{} {
+	return k.queue.DequeueMultiple(n)
 }
 
 func (k *kafkaQueue) Flush() (items []interface{}) {
-	return nil
+	return k.queue.Flush()
 }
 
-func (k *kafkaQueue) Enqueue(item interface{}) (overflow bool) {
-	k.RLock()
-	defer k.RUnlock()
-
+func (k *kafkaQueue) Enqueue(item interface{}) bool {
 	message := &sarama.ProducerMessage{
-		Topic:     k.config.KafkaTopic,
-		Key:       nil,
+		Topic:     k.config.TopicOut,
+		Key:       sarama.ByteEncoder{},
 		Headers:   []sarama.RecordHeader{},
-		Metadata:  nil,
-		Offset:    0,
-		Partition: 0,
 		Timestamp: time.Now(),
+		Offset:    sarama.OffsetNewest,
+		Partition: 0,
 	}
 	switch v := item.(type) {
 	default:
@@ -178,7 +220,7 @@ func (k *kafkaQueue) Enqueue(item interface{}) (overflow bool) {
 	case encoding.BinaryMarshaler:
 		bytes, err := v.MarshalBinary()
 		if err != nil {
-			//TODO: log error
+			k.error(err)
 			return true
 		}
 		message.Value = sarama.ByteEncoder(bytes)
@@ -186,19 +228,44 @@ func (k *kafkaQueue) Enqueue(item interface{}) (overflow bool) {
 		message.Value = sarama.ByteEncoder(v)
 	}
 	if _, _, err := k.producer.SendMessage(message); err != nil {
+		k.error(err)
 		return true
 	}
-	return
+	return false
 }
 
-func (k *kafkaQueue) EnqueueMultiple(items []interface{}) (itemsRemaining []interface{}, overflow bool) {
-	return nil, true
+func (k *kafkaQueue) EnqueueMultiple(items []interface{}) ([]interface{}, bool) {
+	var messages []*sarama.ProducerMessage
+
+	for _, item := range items {
+		message := &sarama.ProducerMessage{
+			Topic:     k.config.TopicOut,
+			Key:       sarama.ByteEncoder{},
+			Headers:   []sarama.RecordHeader{},
+			Timestamp: time.Now(),
+		}
+		switch v := item.(type) {
+		default:
+			k.error(errors.Errorf(ErrUnsupportedTypef, v))
+			return nil, true
+		case encoding.BinaryMarshaler:
+			bytes, err := v.MarshalBinary()
+			if err != nil {
+				k.error(err)
+				return nil, true
+			}
+			message.Value = sarama.ByteEncoder(bytes)
+		case []byte:
+			message.Value = sarama.ByteEncoder(v)
+		}
+	}
+	if err := k.producer.SendMessages(messages); err != nil {
+		k.error(err)
+		return nil, true
+	}
+	return nil, false
 }
 
 func (k *kafkaQueue) Length() (size int) {
-	return -1
-}
-
-func (k *kafkaQueue) Capacity() (capacity int) {
-	return -1
+	return k.queue.Length()
 }
