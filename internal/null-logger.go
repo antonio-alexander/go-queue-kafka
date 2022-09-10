@@ -1,4 +1,4 @@
-package null
+package internal
 
 type NullLogger struct{}
 

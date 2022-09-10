@@ -6,8 +6,7 @@ import (
 	"sync"
 	"time"
 
-	internal_logger "github.com/antonio-alexander/go-queue-kafka/internal/logger"
-	internal_null_logger "github.com/antonio-alexander/go-queue-kafka/internal/logger/null"
+	internal "github.com/antonio-alexander/go-queue-kafka/internal"
 
 	goqueue "github.com/antonio-alexander/go-queue"
 	finite "github.com/antonio-alexander/go-queue/finite"
@@ -16,24 +15,10 @@ import (
 	"github.com/pkg/errors"
 )
 
-type queue interface {
-	finite.Capacity
-	goqueue.Dequeuer
-	goqueue.EnqueueInFronter
-	finite.EnqueueLossy
-	goqueue.Enqueuer
-	goqueue.Event
-	goqueue.GarbageCollecter
-	goqueue.Length
-	goqueue.Owner
-	goqueue.Peeker
-	finite.Resizer
-}
-
 type kafkaQueue struct {
 	sync.RWMutex
 	sync.WaitGroup
-	internal_logger.Logger
+	internal.Logger
 	errorHandler  ErrorHandlerFx
 	config        Configuration
 	ctx           context.Context
@@ -45,15 +30,12 @@ type kafkaQueue struct {
 	queue
 }
 
-var _ sarama.ConsumerGroupHandler = &kafkaQueue{}
-
 func New(parameters ...interface{}) interface {
 	goqueue.Dequeuer
 	goqueue.Enqueuer
 	goqueue.Length
 	goqueue.Owner
 	goqueue.Peeker
-	finite.Resizer
 	Owner
 } {
 	var config *Configuration
@@ -65,12 +47,12 @@ func New(parameters ...interface{}) interface {
 			k.errorHandler = v
 		case *Configuration:
 			config = v
-		case internal_logger.Logger:
+		case internal.Logger:
 			k.Logger = v
 		}
 	}
 	if k.Logger == nil {
-		k.Logger = &internal_null_logger.NullLogger{}
+		k.Logger = &internal.NullLogger{}
 	}
 	if config != nil {
 		if err := k.Initialize(config); err != nil {
@@ -120,12 +102,8 @@ func (k *kafkaQueue) launchConsumerGroup(topic string, consumerGroup sarama.Cons
 	k.Add(1)
 	go func() {
 		defer k.Done()
-		defer func() {
-			k.Printf("stopped consumer group for topic \"%s\"", topic)
-		}()
 
 		close(started)
-		k.Printf("launched partition consumer group for topic \"%s\"", topic)
 		//KIM: this blocks, so it needs to be in a go routine
 		if err := consumerGroup.Consume(k.ctx, []string{topic}, k); err != nil {
 			select {
@@ -150,6 +128,8 @@ func (k *kafkaQueue) error(err error) {
 	}
 }
 
+var _ sarama.ConsumerGroupHandler = &kafkaQueue{}
+
 // Setup is run at the beginning of a new session, before ConsumeClaim.
 func (k *kafkaQueue) Setup(sarama.ConsumerGroupSession) error {
 	return nil
@@ -159,8 +139,15 @@ func (k *kafkaQueue) Setup(sarama.ConsumerGroupSession) error {
 // Once the Messages() channel is closed, the Handler must finish its processing
 // loop and exit.
 func (k *kafkaQueue) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	//TODO: make this configurable
-	tCommit := time.NewTicker(time.Minute)
+	enqueueRate := k.config.EnqueueRate
+	if enqueueRate <= 0 {
+		enqueueRate = time.Second
+	}
+	commitRate := k.config.CommitRate
+	if commitRate <= 0 {
+		commitRate = time.Minute
+	}
+	tCommit := time.NewTicker(commitRate)
 	defer tCommit.Stop()
 	for {
 		select {
@@ -173,15 +160,11 @@ func (k *kafkaQueue) ConsumeClaim(session sarama.ConsumerGroupSession, claim sar
 			if msg == nil {
 				continue
 			}
-			wrapper := &Wrapper{}
-			if err := wrapper.UnmarshalBinary(msg.Value); err != nil {
-				session.MarkMessage(msg, "")
-				k.Printf("received message that couldn't be unmarshalled: %d\n", msg.Offset)
-				k.error(err)
-				continue
-			}
-			overflow := MustEnqueue(session.Context().Done(), k.queue, wrapper)
+			overflow := MustEnqueue(session.Context().Done(), k.queue, msg.Value, enqueueRate)
 			if overflow {
+				//KIM: this is semi-catastrophic and probably needs to be handled better
+				// this would only be an issue if the queue was being closed while
+				// the queue was full; it shouldn't mark the message
 				k.Printf("overflow while trying to enqueue message: %d\n", msg.Offset)
 				continue
 			}
@@ -204,9 +187,12 @@ func (k *kafkaQueue) Initialize(config *Configuration) error {
 	if config == nil {
 		return errors.New("config is nil")
 	}
-	client, err := createKafkaClient(config, k.Logger)
+	client, err := sarama.NewClient(config.ToKafka())
 	if err != nil {
 		return err
+	}
+	if config.EnableLog {
+		sarama.Logger = k.Logger
 	}
 	producer, err := sarama.NewSyncProducerFromClient(client)
 	if err != nil {
@@ -234,8 +220,13 @@ func (k *kafkaQueue) Shutdown() {
 		return
 	}
 	k.cancel()
-	//TODO: place data back into queue
-	k.queue.Close()
+	k.Wait()
+	if items := k.queue.Close(); len(items) > 0 {
+		k.Printf("items in queue, attempting to re-publish")
+		if err := k.publish(items...); err != nil {
+			k.Printf("error while re-publishing in-memory items: %s", err)
+		}
+	}
 	if err := k.consumerGroup.Close(); err != nil {
 		k.Printf("error while closing consumer group: %s", err)
 	}
@@ -248,7 +239,6 @@ func (k *kafkaQueue) Shutdown() {
 	k.producer, k.client = nil, nil
 	k.consumerGroup = nil
 	k.initialized = false
-	k.initialized = false
 }
 
 func (k *kafkaQueue) Close() []interface{} {
@@ -256,16 +246,12 @@ func (k *kafkaQueue) Close() []interface{} {
 	return nil
 }
 
-func (k *kafkaQueue) Length() (size int) {
-	return k.queue.Length()
-}
-
 func (k *kafkaQueue) Enqueue(item interface{}) bool {
-	var bytes []byte
+	var message interface{}
 
 	switch v := item.(type) {
 	default:
-		k.error(errors.Errorf(ErrUnsupportedTypef, v))
+		k.error(errors.Errorf(UnsupportedTypef, v))
 		return true
 	case encoding.BinaryMarshaler:
 		b, err := v.MarshalBinary()
@@ -273,11 +259,11 @@ func (k *kafkaQueue) Enqueue(item interface{}) bool {
 			k.error(err)
 			return true
 		}
-		bytes = b
+		message = b
 	case []byte:
-		bytes = v
+		message = v
 	}
-	if err := k.publish(bytes); err != nil {
+	if err := k.publish(message); err != nil {
 		k.error(err)
 		return true
 	}
@@ -290,7 +276,7 @@ func (k *kafkaQueue) EnqueueMultiple(items []interface{}) ([]interface{}, bool) 
 	for _, item := range items {
 		switch v := item.(type) {
 		default:
-			k.error(errors.Errorf(ErrUnsupportedTypef, v))
+			k.error(errors.Errorf(UnsupportedTypef, v))
 			return nil, true
 		case encoding.BinaryMarshaler:
 			bytes, err := v.MarshalBinary()

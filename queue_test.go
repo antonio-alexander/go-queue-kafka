@@ -10,10 +10,9 @@ import (
 	"time"
 
 	kafka "github.com/antonio-alexander/go-queue-kafka"
-	internal_logger "github.com/antonio-alexander/go-queue-kafka/internal/logger"
+	internal "github.com/antonio-alexander/go-queue-kafka/internal"
 
 	goqueue "github.com/antonio-alexander/go-queue"
-	finite "github.com/antonio-alexander/go-queue/finite"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -22,13 +21,12 @@ import (
 var kafkaQueueConfig = &kafka.Configuration{}
 
 type kafkaQueueTest struct {
-	logger internal_logger.Logger
+	logger internal.Logger
 	queue  interface {
 		goqueue.Dequeuer
 		goqueue.Enqueuer
 		goqueue.Length
 		goqueue.Owner
-		finite.Resizer
 		kafka.Owner
 	}
 }
@@ -179,8 +177,6 @@ func (k *kafkaQueueTest) TestSimple(t *testing.T) {
 
 func (k *kafkaQueueTest) TestEnqueue(t *testing.T) {
 	//
-	k.queue.Resize(1)
-
 	time.Sleep(2 * time.Second)
 	//
 	for i := 0; i < 5; i++ {
@@ -191,18 +187,24 @@ func (k *kafkaQueueTest) TestEnqueue(t *testing.T) {
 			},
 		})
 		assert.Nil(t, err)
-		overflow := kafka.MustEnqueue(make(<-chan struct{}), k.queue, wrapper)
+		bytes, err := wrapper.MarshalBinary()
+		assert.Nil(t, err)
+		overflow := kafka.MustEnqueue(make(<-chan struct{}), k.queue, bytes, time.Second)
 		assert.False(t, overflow)
 	}
 
 	//
 	for i := 0; i < 5; i++ {
-		item, underflow := kafka.MustDequeue(make(chan struct{}), k.queue)
+		item, underflow := kafka.MustDequeue(make(chan struct{}), k.queue, time.Second)
 		assert.False(t, underflow)
-		wrapper, ok := item.(*kafka.Wrapper)
+		bytes, ok := item.([]byte)
 		assert.True(t, ok)
-		item, err := wrapper.FromWrapper()
+		wrapper := &kafka.Wrapper{}
+		err := wrapper.UnmarshalBinary(bytes)
 		assert.Nil(t, err)
+		item, err = wrapper.FromWrapper()
+		assert.Nil(t, err)
+		assert.IsType(t, &kafka.Example{}, item)
 		example, _ := item.(*kafka.Example)
 		assert.Equal(t, i, example.Int)
 	}
@@ -220,6 +222,6 @@ func TestKafkaQueue(t *testing.T) {
 
 	k.initialize(t)
 	// t.Run("Test Simple", k.TestSimple)
-	t.Run("Test Simple", k.TestEnqueue)
+	t.Run("Test Enqueue", k.TestEnqueue)
 	k.shutdown(t)
 }

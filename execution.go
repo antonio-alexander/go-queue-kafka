@@ -3,32 +3,10 @@ package kafka
 import (
 	"time"
 
-	internal_logger "github.com/antonio-alexander/go-queue-kafka/internal/logger"
-
 	goqueue "github.com/antonio-alexander/go-queue"
-
-	"github.com/Shopify/sarama"
 )
 
-func createKafkaClient(c *Configuration, logger internal_logger.Logger) (sarama.Client, error) {
-	config := sarama.NewConfig()
-	config.ClientID = c.ClientId
-	config.Producer.Retry.Max = 5
-	config.Producer.RequiredAcks = sarama.WaitForAll
-	config.Producer.Return.Successes = true
-	config.ChannelBufferSize = 1024
-	config.Consumer.Return.Errors = true
-	client, err := sarama.NewClient(c.Brokers, config)
-	if err != nil {
-		return nil, err
-	}
-	if c.EnableLog {
-		sarama.Logger = logger
-	}
-	return client, nil
-}
-
-func MustEnqueue(done <-chan struct{}, queue interface{}, item interface{}) bool {
+func MustEnqueue(done <-chan struct{}, queue interface{}, item interface{}, rate time.Duration) bool {
 	switch queue := queue.(type) {
 	default:
 		return true
@@ -39,7 +17,6 @@ func MustEnqueue(done <-chan struct{}, queue interface{}, item interface{}) bool
 		if overflow := queue.Enqueue(item); !overflow {
 			return overflow
 		}
-		//TODO: make this configurable
 		signalOut := queue.GetSignalOut()
 		for {
 			select {
@@ -55,8 +32,7 @@ func MustEnqueue(done <-chan struct{}, queue interface{}, item interface{}) bool
 		if overflow := queue.Enqueue(item); !overflow {
 			return overflow
 		}
-		//TODO: make this configurable
-		tEnqueue := time.NewTicker(time.Second)
+		tEnqueue := time.NewTicker(rate)
 		defer tEnqueue.Stop()
 		for {
 			select {
@@ -69,10 +45,9 @@ func MustEnqueue(done <-chan struct{}, queue interface{}, item interface{}) bool
 			}
 		}
 	}
-	return true
 }
 
-func MustDequeue(done <-chan struct{}, queue interface{}) (item interface{}, underflow bool) {
+func MustDequeue(done <-chan struct{}, queue interface{}, rate time.Duration) (item interface{}, underflow bool) {
 	switch queue := queue.(type) {
 	default:
 		return nil, true
@@ -98,7 +73,7 @@ func MustDequeue(done <-chan struct{}, queue interface{}) (item interface{}, und
 		if item, underflow = queue.Dequeue(); !underflow {
 			return
 		}
-		tDequeue := time.NewTicker(time.Millisecond)
+		tDequeue := time.NewTicker(rate)
 		defer tDequeue.Stop()
 		for {
 			select {

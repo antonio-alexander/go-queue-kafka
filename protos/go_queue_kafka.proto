@@ -1,12 +1,10 @@
 /* 
-    go_queue_kafka defines a set of types  for use with the kafka queue
+    go_queue_kafka defines a set of types for use with the kafka queue
 */
 
 syntax = "proto3";
    
 package go_queue_kafka;
-  
-import "google/protobuf/any.proto";
 
 option go_package = "github.com/antonio-alexander/go-queue-kafka/protos";
 
@@ -16,12 +14,18 @@ message Wrapper {
     // type is a string identifying the type of payload
     string type = 1;
 
-    // payload describes the payload as protobuf.any
-    google.protobuf.Any payload = 2;
+    // bytes describes the payload
+    bytes bytes = 2;
 }
 
-// Bytes makes it easier to provide
-message Bytes {
-    // bytes describes the payload
-    bytes bytes = 1;
+// Example
+message Example {
+    // int
+    int32 int = 1;
+
+    // float64
+    double float64 = 2;
+
+    // string
+    string string = 3;
 }

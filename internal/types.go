@@ -1,4 +1,4 @@
-package logger
+package internal
 
 type Logger interface {
 	Print(v ...interface{})
