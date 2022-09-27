@@ -11,55 +11,52 @@ import (
 )
 
 const (
-	DefaultTopicIn     string        = "queue.in"
-	DefaultTopicOut    string        = "queue.out"
-	DefaultQueueSize   int           = 10000
-	DefaultCommitRate  time.Duration = time.Minute
-	DefaultEnqueueRate time.Duration = time.Millisecond
+	DefaultTopicIn           string        = "queue.in"
+	DefaultTopicOut          string        = "queue.out"
+	DefaultQueueSize         int           = 10000
+	DefaultCommitRate        time.Duration = time.Minute
+	DefaultRebalanceStrategy string        = "roundrobin"
 )
 
 var DefaultBrokers = []string{"localhost:9092"}
 
 const (
-	EnvNameKafkaBrokers   string = "KAFKA_BROKERS"
-	EnvNameKafkaClientId  string = "KAFKA_CLIENT_ID"
-	EnvNameKafkaGroupId   string = "KAFKA_GROUP_ID"
-	EnvNameKafkaEnableLog string = "KAFKA_ENABLE_LOG"
-	EnvNameKafkaQueueSize string = "KAFKA_QUEUE_SIZE"
-	EnvNameKafkaTopicIn   string = "KAFKA_TOPIC_IN"
-	EnvNameKafkaTopicOut  string = "KAFKA_TOPIC_OUT"
-	EnvNameCommitRate     string = "KAFKA_COMMIT_RATE"
-	EnvNameEnqueueRate    string = "KAFKA_ENQUEUE_RATE"
+	EnvNameKafkaBrokers      string = "KAFKA_BROKERS"
+	EnvNameKafkaClientId     string = "KAFKA_CLIENT_ID"
+	EnvNameKafkaGroupId      string = "KAFKA_GROUP_ID"
+	EnvNameKafkaEnableLog    string = "KAFKA_ENABLE_LOG"
+	EnvNameKafkaQueueSize    string = "KAFKA_QUEUE_SIZE"
+	EnvNameKafkaTopicIn      string = "KAFKA_TOPIC_IN"
+	EnvNameKafkaTopicOut     string = "KAFKA_TOPIC_OUT"
+	EnvNameCommitRate        string = "KAFKA_COMMIT_RATE"
+	EnvNameRebalanceStrategy string = "KAFKA_REBALANCE_STRATEGY"
 )
 
 const (
-	UnsupportedTypef               string = "unsupported type: %T"
-	NoBrokersConfigured            string = "no brokers configured"
-	NoClientIdConfigured           string = "no client id configured"
-	NoGroupIdConfigured            string = "no group id configured"
-	CommitRateLessThanOrEqualZero  string = "commit rate less than or equal to zero"
-	EnqueueRateLessThanOrEqualZero string = "enqueue rate less than or equal to zero"
+	UnsupportedTypef              string = "unsupported type: %T"
+	NoBrokersConfigured           string = "no brokers configured"
+	NoClientIdConfigured          string = "no client id configured"
+	NoGroupIdConfigured           string = "no group id configured"
+	CommitRateLessThanOrEqualZero string = "commit rate less than or equal to zero"
 )
 
 var (
-	ErrNoBrokersConfigured            = errors.New(NoBrokersConfigured)
-	ErrNoClientIdConfigured           = errors.New(NoClientIdConfigured)
-	ErrNoGroupIdConfigured            = errors.New(NoGroupIdConfigured)
-	ErrCommitRateLessThanOrEqualZero  = errors.New(CommitRateLessThanOrEqualZero)
-	ErrEnqueueRateLessThanOrEqualZero = errors.New(EnqueueRateLessThanOrEqualZero)
+	ErrNoBrokersConfigured           = errors.New(NoBrokersConfigured)
+	ErrNoClientIdConfigured          = errors.New(NoClientIdConfigured)
+	ErrNoGroupIdConfigured           = errors.New(NoGroupIdConfigured)
+	ErrCommitRateLessThanOrEqualZero = errors.New(CommitRateLessThanOrEqualZero)
 )
 
 type Configuration struct {
-	Brokers       []string      `json:"brokers"`
-	ClientId      string        `json:"client_id"`
-	GroupId       string        `json:"group_id"`
-	EnableLog     bool          `json:"enable_log"`
-	ConsumerGroup bool          `json:"consumer_group"`
-	QueueSize     int           `json:"queue_size"`
-	TopicIn       string        `json:"topic_in"`
-	TopicOut      string        `json:"topic_out"`
-	CommitRate    time.Duration `json:"commit_rate"`
-	EnqueueRate   time.Duration `json:"enqueue_rate"`
+	Brokers           []string      `json:"brokers"`
+	ClientId          string        `json:"client_id"`
+	GroupId           string        `json:"group_id"`
+	EnableLog         bool          `json:"enable_log"`
+	QueueSize         int           `json:"queue_size"`
+	TopicIn           string        `json:"topic_in"`
+	TopicOut          string        `json:"topic_out"`
+	CommitRate        time.Duration `json:"commit_rate"`
+	RebalanceStrategy string        `json:"rebalance_strategy"`
 }
 
 func (c *Configuration) Default() {
@@ -70,7 +67,7 @@ func (c *Configuration) Default() {
 	c.TopicIn = DefaultTopicIn
 	c.TopicOut = DefaultTopicOut
 	c.CommitRate = DefaultCommitRate
-	c.EnqueueRate = DefaultEnqueueRate
+	c.RebalanceStrategy = DefaultRebalanceStrategy
 }
 
 func (c *Configuration) FromEnv(envs map[string]string) {
@@ -86,6 +83,9 @@ func (c *Configuration) FromEnv(envs map[string]string) {
 	if brokers, ok := envs[EnvNameKafkaBrokers]; ok && brokers != "" {
 		c.Brokers = strings.Split(brokers, ",")
 	}
+	if rebalanceStrategy, ok := envs[EnvNameRebalanceStrategy]; ok && rebalanceStrategy != "" {
+		c.RebalanceStrategy = rebalanceStrategy
+	}
 	if clientId, ok := envs[EnvNameKafkaClientId]; ok && clientId != "" {
 		c.ClientId = clientId
 	}
@@ -97,9 +97,6 @@ func (c *Configuration) FromEnv(envs map[string]string) {
 	}
 	if s, ok := envs[EnvNameCommitRate]; ok {
 		c.CommitRate, _ = time.ParseDuration(s)
-	}
-	if s, ok := envs[EnvNameEnqueueRate]; ok {
-		c.EnqueueRate, _ = time.ParseDuration(s)
 	}
 }
 
@@ -116,9 +113,6 @@ func (c *Configuration) Validate() error {
 	if c.CommitRate <= 0 {
 		return ErrCommitRateLessThanOrEqualZero
 	}
-	if c.EnqueueRate <= 0 {
-		return ErrEnqueueRateLessThanOrEqualZero
-	}
 	return nil
 }
 
@@ -130,5 +124,14 @@ func (c *Configuration) ToKafka() ([]string, *sarama.Config) {
 	kafkaConfig.Producer.Return.Successes = true
 	kafkaConfig.ChannelBufferSize = 1024
 	kafkaConfig.Consumer.Return.Errors = true
+	switch c.RebalanceStrategy {
+	// case "roundrobin":
+	default:
+		kafkaConfig.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRoundRobin
+	case "sticky":
+		kafkaConfig.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategySticky
+	case "range":
+		kafkaConfig.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
+	}
 	return c.Brokers, kafkaConfig
 }

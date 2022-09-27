@@ -11,27 +11,34 @@ import (
 
 	kafka "github.com/antonio-alexander/go-queue-kafka"
 	internal "github.com/antonio-alexander/go-queue-kafka/internal"
+	pb "github.com/antonio-alexander/go-queue-kafka/protos"
 
 	goqueue "github.com/antonio-alexander/go-queue"
+	infinite_tests "github.com/antonio-alexander/go-queue/infinite/tests"
+	goqueue_tests "github.com/antonio-alexander/go-queue/tests"
 
+	"github.com/Shopify/sarama"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+)
+
+const (
+	mustRate    = time.Second
+	mustTimeout = 5 * time.Second
 )
 
 var kafkaQueueConfig = &kafka.Configuration{}
 
 type kafkaQueueTest struct {
 	logger internal.Logger
-	queue  interface {
-		goqueue.Dequeuer
-		goqueue.Enqueuer
-		goqueue.Length
-		goqueue.Owner
-		kafka.Owner
-	}
+	config *kafka.Configuration
 }
 
 func init() {
+	//seed the random package
+	rand.Seed(time.Now().UnixNano())
+
+	//get the environment
 	envs := make(map[string]string)
 	for _, s := range os.Environ() {
 		if s := strings.Split(s, "="); len(s) > 1 {
@@ -39,26 +46,15 @@ func init() {
 		}
 	}
 
-	kafkaQueueConfig.FromEnv(envs)
-
-	//
+	//update with some known constants
 	kafkaQueueConfig.TopicIn = "queue_in"
 	kafkaQueueConfig.TopicOut = "queue_in"
 	kafkaQueueConfig.Brokers = []string{"localhost:9092"}
 	kafkaQueueConfig.QueueSize = 1000
-	kafkaQueueConfig.ClientId = uuid.Must(uuid.NewRandom()).String()
-	kafkaQueueConfig.GroupId = uuid.Must(uuid.NewRandom()).String()
-	kafkaQueueConfig.ConsumerGroup = false
 	kafkaQueueConfig.EnableLog = true
 
-	//
-	rand.Seed(time.Now().UnixNano())
-}
-
-func errorHandlerFx(t *testing.T) func(err error) {
-	return func(err error) {
-		t.Log(err)
-	}
+	//generate the configuration from the environment
+	kafkaQueueConfig.FromEnv(envs)
 }
 
 //REFERENCE: https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
@@ -76,60 +72,121 @@ func randomString(nLetters ...int) string {
 }
 
 func newKafkaServiceTest(t *testing.T) *kafkaQueueTest {
-	logger := log.New(os.Stdout, "", log.Ltime)
-	queue := kafka.New(logger, errorHandlerFx(t))
-	//KIM: if we don't flush because sql is persistent
-	// all the tests will fail because of data from a
-	// previous test
 	return &kafkaQueueTest{
-		queue:  queue,
-		logger: logger,
+		logger: log.New(os.Stdout, "", log.Ltime),
+		config: kafkaQueueConfig,
 	}
 }
 
-func (k *kafkaQueueTest) initialize(t *testing.T) {
-	err := k.queue.Initialize(kafkaQueueConfig)
-	assert.Nil(t, err)
+func (k *kafkaQueueTest) errorHandlerFx(t *testing.T) func(err error) {
+	return func(err error) {
+		assert.Nil(t, err)
+	}
 }
 
-func (k *kafkaQueueTest) shutdown(t *testing.T) {
-	k.queue.Shutdown()
-}
+func (k *kafkaQueueTest) TestConsumerGroup(t *testing.T) {
+	const nExamples = 10
 
-func (k *kafkaQueueTest) TestSimple(t *testing.T) {
 	var wg sync.WaitGroup
+	var mu sync.RWMutex
 
-	example := &kafka.Example{
-		Example: goqueue.Example{
-			Int:    rand.Int(),
-			Float:  rand.Float64(),
-			String: randomString(25),
-		},
-	}
+	//use sarama admin to create a new topic
+	topic := uuid.Must(uuid.NewRandom()).String()
+	k.config.TopicIn, k.config.TopicOut = topic, topic
+	k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+	admin, err := sarama.NewClusterAdmin(k.config.ToKafka())
+	defer func() { admin.Close() }()
+	assert.Nil(t, err)
+	err = admin.CreateTopic(topic, &sarama.TopicDetail{
+		NumPartitions:     2,
+		ReplicationFactor: 1,
+	}, false)
+	assert.Nil(t, err)
+	err = admin.Close()
+	assert.Nil(t, err)
+
+	//create two queues with the same group id, but different client ids
+	k.config.GroupId = uuid.Must(uuid.NewRandom()).String()
+
+	//initialize the first queue/consumer group
+	q1 := kafka.New(k.errorHandlerFx(t), k.logger)
+	k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+	err = q1.Initialize(k.config)
+	assert.Nil(t, err)
+	defer func() { q1.Shutdown() }()
+
+	//initialize the second queue/consumer group
+	q2 := kafka.New(k.errorHandlerFx(t), k.logger)
+	k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+	err = q2.Initialize(k.config)
+	assert.Nil(t, err)
+	defer func() { q2.Shutdown() }()
+
+	//
+	examplesRead := make(map[kafka.Example]struct{})
+	examplesWritten := make(map[kafka.Example]struct{})
 	start := make(chan struct{})
 	stopper := make(chan struct{})
-	wrapperReceived := make(chan struct{})
+	messagesRead := make(chan struct{})
+	messagesWritten := make(chan struct{})
+
+	//use one of the queues to enqueue data
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 
-		wrapper := &kafka.Wrapper{}
-		wrapper.ToWrapper(example)
-		tEnqueue := time.NewTicker(time.Second)
-		defer tEnqueue.Stop()
+		<-start
+		//KIM: without adding some call/response code, there's no synchronous way
+		// to ensure that the newly created consumer group is receiving these
+		// published items
+		time.Sleep(5 * time.Second)
+		for i := 0; i < nExamples; i++ {
+			exampleWritten := &kafka.Example{
+				&pb.Example{
+					Int:     rand.Int31(),
+					Float64: rand.Float64(),
+					String_: randomString(),
+				},
+			}
+			goqueue.MustEnqueueEvent(q1, exampleWritten, stopper)
+			examplesWritten[*exampleWritten] = struct{}{}
+		}
+		close(messagesWritten)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
 		<-start
 		for {
 			select {
 			case <-stopper:
 				return
-			case <-wrapperReceived:
+			case <-messagesRead:
 				return
-			case <-tEnqueue.C:
-				overflow := k.queue.Enqueue(wrapper)
-				if overflow {
-					t.Log("overflow here...")
+			default:
+				item, underflow := goqueue.MustDequeueEvent(q1, stopper)
+				if underflow {
+					continue
 				}
-				return
+				bytes, _ := item.([]byte)
+				exampleRead := &kafka.Example{}
+				if err := exampleRead.UnmarshalBinary(bytes); err == nil {
+					mu.Lock()
+					examplesRead[*exampleRead] = struct{}{}
+					select {
+					default:
+					case <-messagesWritten:
+						if len(examplesRead) == len(examplesWritten) {
+							select {
+							default:
+								close(messagesRead)
+							case <-messagesRead:
+							}
+						}
+					}
+					mu.Unlock()
+				}
 			}
 		}
 	}()
@@ -137,91 +194,311 @@ func (k *kafkaQueueTest) TestSimple(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		tDequeue := time.NewTicker(time.Second)
-		defer tDequeue.Stop()
 		<-start
 		for {
 			select {
 			case <-stopper:
 				return
-			case <-tDequeue.C:
-				item, _ := k.queue.Dequeue()
-				wrapperRead, ok := item.(*kafka.Wrapper)
-				if !ok {
+			default:
+				item, underflow := goqueue.MustDequeueEvent(q2, stopper)
+				if underflow {
 					continue
 				}
+				bytes, _ := item.([]byte)
 				exampleRead := &kafka.Example{}
-				if exampleRead.Type() != wrapperRead.Type {
-					continue
+				if err := exampleRead.UnmarshalBinary(bytes); err == nil {
+					mu.Lock()
+					examplesRead[*exampleRead] = struct{}{}
+					select {
+					default:
+					case <-messagesWritten:
+						if len(examplesRead) == len(examplesWritten) {
+							select {
+							default:
+								close(messagesRead)
+							case <-messagesRead:
+							}
+						}
+					}
+					mu.Unlock()
 				}
-				err := exampleRead.UnmarshalBinary(wrapperRead.Bytes)
-				if err != nil {
-					continue
-				}
-				if !assert.Equal(t, exampleRead, example) {
-					continue
-				}
-				close(wrapperReceived)
 			}
 		}
 	}()
 	close(start)
 	select {
 	case <-time.After(10 * time.Second):
-		assert.Fail(t, "unable to confirm wrapper received")
-	case <-wrapperReceived:
+	case <-messagesRead:
 	}
 	close(stopper)
 	wg.Wait()
+
+	//validate that all data was received (the order is irrelevant)
+	assert.Equal(t, len(examplesRead), len(examplesWritten))
+	assert.Condition(t, func() bool {
+		if len(examplesWritten) != len(examplesRead) {
+			return false
+		}
+		for exampleRead := range examplesRead {
+			if _, ok := examplesWritten[exampleRead]; !ok {
+				return false
+			}
+		}
+		return true
+	})
+
+	//shutdown
+	q1.Shutdown()
+	q2.Shutdown()
 }
 
-func (k *kafkaQueueTest) TestEnqueue(t *testing.T) {
-	//
-	time.Sleep(2 * time.Second)
-	//
-	for i := 0; i < 5; i++ {
-		wrapper := &kafka.Wrapper{}
-		err := wrapper.ToWrapper(&kafka.Example{
-			Example: goqueue.Example{
-				Int: i,
-			},
-		})
-		assert.Nil(t, err)
-		bytes, err := wrapper.MarshalBinary()
-		assert.Nil(t, err)
-		overflow := kafka.MustEnqueue(make(<-chan struct{}), k.queue, bytes, time.Second)
-		assert.False(t, overflow)
-	}
+func (k *kafkaQueueTest) TestQueue(t *testing.T) {
+	var topics []string
 
-	//
-	for i := 0; i < 5; i++ {
-		item, underflow := kafka.MustDequeue(make(chan struct{}), k.queue, time.Second)
-		assert.False(t, underflow)
-		bytes, ok := item.([]byte)
-		assert.True(t, ok)
-		wrapper := &kafka.Wrapper{}
-		err := wrapper.UnmarshalBinary(bytes)
+	//KIM: the premise of most of these tests is that although the
+	// length is infinite, the order should be maintained, so we
+	// absolutely can't load balance across multiple partitions
+	// or the tests will fail due to behavior issues (all of the
+	// topics we'll create have a single partition)
+
+	//create the kafka admin so we can create topics
+	k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+	admin, err := sarama.NewClusterAdmin(k.config.ToKafka())
+	defer func() {
+		for _, topic := range topics {
+			err := admin.DeleteTopic(topic)
+			assert.Nil(t, err)
+		}
+		err = admin.Close()
 		assert.Nil(t, err)
-		item, err = wrapper.FromWrapper()
+	}()
+	assert.Nil(t, err)
+
+	newKafkaQueue := func(size ...int) interface {
+		goqueue.Dequeuer
+		goqueue.Enqueuer
+		goqueue.Event
+		goqueue.Length
+		goqueue.Owner
+		goqueue.Peeker
+	} {
+		//use sarama admin to create a new topic
+		topic := uuid.Must(uuid.NewRandom()).String()
+		topics = append(topics, topic)
+		err = admin.CreateTopic(topic, &sarama.TopicDetail{
+			NumPartitions:     1,
+			ReplicationFactor: 1,
+		}, false)
 		assert.Nil(t, err)
-		assert.IsType(t, &kafka.Example{}, item)
-		example, _ := item.(*kafka.Example)
-		assert.Equal(t, i, example.Int)
+		//create a new/unique group/client id every time so we don't have
+		// to flush
+		k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+		k.config.GroupId = uuid.Must(uuid.NewRandom()).String()
+		k.config.TopicIn, k.config.TopicOut = topic, topic
+		if len(size) > 0 {
+			k.config.QueueSize = size[0]
+		}
+		k.config.EnableLog = false
+		parameters := []interface{}{
+			k.errorHandlerFx(t),
+			k.config,
+			// k.logger,
+		}
+		return kafka.New(parameters...)
 	}
+	t.Run("Peek", goqueue_tests.TestPeek(t, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+		goqueue.Peeker
+	} {
+		return newKafkaQueue(size)
+	}))
+	t.Run("Peek From Head", goqueue_tests.TestPeekFromHead(t, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+		goqueue.Peeker
+	} {
+		return newKafkaQueue(size)
+	}))
+	t.Run("Event", goqueue_tests.TestEvent(t, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+		goqueue.Event
+	} {
+		return newKafkaQueue(size)
+	}))
+	// t.Run("Queue", goqueue_tests.TestQueue(t, mustRate, mustTimeout, func(size int) interface {
+	// 	goqueue.Owner
+	// 	goqueue.Enqueuer
+	// 	goqueue.Dequeuer
+	// } {
+	// 	return newKafkaQueue(size)
+	// }))
+	t.Run("Asynchronous", goqueue_tests.TestAsync(t, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+	} {
+		return newKafkaQueue(size)
+	}))
 }
 
-//TODO: these are the things I want to test
-// How multiple queues work with consumer groups
-// General latency between enquing and dequeueing
-// How to properly peek, what are the mitigation strategies for data loss
-// how we can peek using the kafka client without marking the message as read
-// how we can know how many messages are available to read
+func (k *kafkaQueueTest) TestFiniteQueue(t *testing.T) {
+	var topics []string
+
+	//KIM: the premise of most of these tests is that although the
+	// length is infinite, the order should be maintained, so we
+	// absolutely can't load balance across multiple partitions
+	// or the tests will fail due to behavior issues (all of the
+	// topics we'll create have a single partition)
+
+	//create the kafka admin so we can create topics
+	k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+	admin, err := sarama.NewClusterAdmin(k.config.ToKafka())
+	defer func() {
+		for _, topic := range topics {
+			err := admin.DeleteTopic(topic)
+			assert.Nil(t, err)
+		}
+		err = admin.Close()
+		assert.Nil(t, err)
+	}()
+	assert.Nil(t, err)
+
+	newKafkaQueue := func(size ...int) interface {
+		goqueue.Dequeuer
+		goqueue.Enqueuer
+		goqueue.Event
+		goqueue.Length
+		goqueue.Owner
+		goqueue.Peeker
+	} {
+		//use sarama admin to create a new topic
+		topic := uuid.Must(uuid.NewRandom()).String()
+		topics = append(topics, topic)
+		err = admin.CreateTopic(topic, &sarama.TopicDetail{
+			NumPartitions:     1,
+			ReplicationFactor: 1,
+		}, false)
+		assert.Nil(t, err)
+		//create a new/unique group/client id every time so we don't have
+		// to flush
+		k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+		k.config.GroupId = uuid.Must(uuid.NewRandom()).String()
+		k.config.TopicIn, k.config.TopicOut = topic, topic
+		if len(size) > 0 {
+			k.config.QueueSize = size[0]
+		}
+		k.config.EnableLog = false
+		parameters := []interface{}{
+			k.errorHandlerFx(t),
+			k.config,
+			// k.logger,
+		}
+		return kafka.New(parameters...)
+	}
+	t.Run("Dequeue", goqueue_tests.TestDequeue(t, mustRate, mustTimeout, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+	} {
+		return newKafkaQueue(size)
+	}))
+	t.Run("Dequeue Multiple", goqueue_tests.TestDequeueMultiple(t, mustRate, mustTimeout, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+	} {
+		return newKafkaQueue(size)
+	}))
+	t.Run("Flush", goqueue_tests.TestFlush(t, mustRate, mustTimeout, func(size int) interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+	} {
+		return newKafkaQueue(size)
+	}))
+}
+
+func (k *kafkaQueueTest) TestInfiniteQueue(t *testing.T) {
+	var topics []string
+
+	//KIM: the premise of most of these tests is that although the
+	// length is infinite, the order should be maintained, so we
+	// absolutely can't load balance across multiple partitions
+	// or the tests will fail due to behavior issues (all of the
+	// topics we'll create have a single partition)
+
+	//create the kafka admin so we can create topics
+	k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+	admin, err := sarama.NewClusterAdmin(k.config.ToKafka())
+	defer func() {
+		for _, topic := range topics {
+			err := admin.DeleteTopic(topic)
+			assert.Nil(t, err)
+		}
+		err = admin.Close()
+		assert.Nil(t, err)
+	}()
+	assert.Nil(t, err)
+
+	newKafkaQueue := func(size ...int) interface {
+		goqueue.Dequeuer
+		goqueue.Enqueuer
+		goqueue.Event
+		goqueue.Length
+		goqueue.Owner
+		goqueue.Peeker
+	} {
+		//use sarama admin to create a new topic
+		topic := uuid.Must(uuid.NewRandom()).String()
+		topics = append(topics, topic)
+		err = admin.CreateTopic(topic, &sarama.TopicDetail{
+			NumPartitions:     1,
+			ReplicationFactor: 1,
+		}, false)
+		assert.Nil(t, err)
+		//create a new/unique group/client id every time so we don't have
+		// to flush
+		k.config.ClientId = uuid.Must(uuid.NewRandom()).String()
+		k.config.GroupId = uuid.Must(uuid.NewRandom()).String()
+		k.config.TopicIn, k.config.TopicOut = topic, topic
+		if len(size) > 0 {
+			k.config.QueueSize = size[0]
+		}
+		k.config.EnableLog = false
+		parameters := []interface{}{
+			k.errorHandlerFx(t),
+			k.config,
+			// k.logger,
+		}
+		return kafka.New(parameters...)
+	}
+
+	t.Run("Enqueue", infinite_tests.TestEnqueue(t, mustRate, mustTimeout, func() interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+	} {
+		return newKafkaQueue()
+	}))
+	t.Run("Enqueue Multiple", infinite_tests.TestEnqueueMultiple(t, mustRate, mustTimeout, func() interface {
+		goqueue.Owner
+		goqueue.Enqueuer
+		goqueue.Dequeuer
+	} {
+		return newKafkaQueue()
+	}))
+}
 
 func TestKafkaQueue(t *testing.T) {
 	k := newKafkaServiceTest(t)
 
-	k.initialize(t)
-	// t.Run("Test Simple", k.TestSimple)
-	t.Run("Test Enqueue", k.TestEnqueue)
-	k.shutdown(t)
+	t.Run("Test Consumer Group", k.TestConsumerGroup)
+	// t.Run("Test Infinite Queue", k.TestInfiniteQueue)
+	// t.Run("Test Finite Queue", k.TestFiniteQueue)
+	// t.Run("Test Queue", k.TestQueue)
 }

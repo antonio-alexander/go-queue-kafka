@@ -3,6 +3,6 @@
         "-v",
         "-count=1",
         "-p=1",
-        "--timeout=2m"
+        "--timeout=10m"
     ],
 }

@@ -19,14 +19,15 @@ type kafkaQueue struct {
 	sync.RWMutex
 	sync.WaitGroup
 	internal.Logger
-	errorHandler  ErrorHandlerFx
-	config        Configuration
-	ctx           context.Context
-	cancel        context.CancelFunc
-	client        sarama.Client
-	producer      sarama.SyncProducer
-	consumerGroup sarama.ConsumerGroup
-	initialized   bool
+	errorHandler     ErrorHandlerFx
+	config           Configuration
+	ctx              context.Context
+	cancel           context.CancelFunc
+	client           sarama.Client
+	producer         sarama.SyncProducer
+	consumerGroup    sarama.ConsumerGroup
+	initialized      bool
+	chReadyToConsume chan struct{}
 	queue
 }
 
@@ -36,6 +37,8 @@ func New(parameters ...interface{}) interface {
 	goqueue.Length
 	goqueue.Owner
 	goqueue.Peeker
+	goqueue.Event
+	goqueue.GarbageCollecter
 	Owner
 } {
 	var config *Configuration
@@ -84,42 +87,11 @@ func (k *kafkaQueue) publish(items ...interface{}) error {
 			byteEncoder = sarama.ByteEncoder(v)
 		}
 		messages = append(messages, &sarama.ProducerMessage{
-			Topic:     k.config.TopicIn,
-			Key:       sarama.ByteEncoder{},
-			Headers:   []sarama.RecordHeader{},
-			Timestamp: time.Now(),
-			Offset:    sarama.OffsetNewest,
-			Partition: 0,
-			Value:     byteEncoder,
+			Topic: k.config.TopicIn,
+			Value: byteEncoder,
 		})
 	}
 	return k.producer.SendMessages(messages)
-}
-
-func (k *kafkaQueue) launchConsumerGroup(topic string, consumerGroup sarama.ConsumerGroup) error {
-	started := make(chan struct{})
-	chErr := make(chan error)
-	k.Add(1)
-	go func() {
-		defer k.Done()
-
-		close(started)
-		//KIM: this blocks, so it needs to be in a go routine
-		if err := consumerGroup.Consume(k.ctx, []string{topic}, k); err != nil {
-			select {
-			default:
-			case chErr <- err:
-			}
-		}
-	}()
-	<-started
-	select {
-	default:
-		close(chErr)
-		return nil
-	case err := <-chErr:
-		return err
-	}
 }
 
 func (k *kafkaQueue) error(err error) {
@@ -128,7 +100,46 @@ func (k *kafkaQueue) error(err error) {
 	}
 }
 
-var _ sarama.ConsumerGroupHandler = &kafkaQueue{}
+func (k *kafkaQueue) setReady() {
+	k.Lock()
+	defer k.Unlock()
+	select {
+	default:
+		close(k.chReadyToConsume)
+	case <-k.chReadyToConsume:
+	}
+}
+
+func (k *kafkaQueue) unsetReady() {
+	k.Lock()
+	defer k.Unlock()
+	select {
+	default:
+	case <-k.chReadyToConsume:
+		k.chReadyToConsume = make(chan struct{})
+	}
+}
+
+func (k *kafkaQueue) launchConsumerGroup() {
+	started := make(chan struct{})
+	k.Add(1)
+	go func() {
+		defer k.Done()
+
+		k.chReadyToConsume = make(chan struct{})
+		close(started)
+		for {
+			if err := k.consumerGroup.Consume(k.ctx, []string{k.config.TopicIn}, k); err != nil {
+				k.errorHandler(err)
+				return
+			}
+			if k.ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+	<-started
+}
 
 // Setup is run at the beginning of a new session, before ConsumeClaim.
 func (k *kafkaQueue) Setup(sarama.ConsumerGroupSession) error {
@@ -139,16 +150,14 @@ func (k *kafkaQueue) Setup(sarama.ConsumerGroupSession) error {
 // Once the Messages() channel is closed, the Handler must finish its processing
 // loop and exit.
 func (k *kafkaQueue) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	enqueueRate := k.config.EnqueueRate
-	if enqueueRate <= 0 {
-		enqueueRate = time.Second
-	}
 	commitRate := k.config.CommitRate
 	if commitRate <= 0 {
-		commitRate = time.Minute
+		commitRate = DefaultCommitRate
 	}
 	tCommit := time.NewTicker(commitRate)
 	defer tCommit.Stop()
+	k.setReady()
+	defer k.unsetReady()
 	for {
 		select {
 		case <-session.Context().Done():
@@ -160,7 +169,7 @@ func (k *kafkaQueue) ConsumeClaim(session sarama.ConsumerGroupSession, claim sar
 			if msg == nil {
 				continue
 			}
-			overflow := MustEnqueue(session.Context().Done(), k.queue, msg.Value, enqueueRate)
+			overflow := goqueue.MustEnqueueEvent(k.queue, msg.Value, session.Context().Done())
 			if overflow {
 				//KIM: this is semi-catastrophic and probably needs to be handled better
 				// this would only be an issue if the queue was being closed while
@@ -169,7 +178,7 @@ func (k *kafkaQueue) ConsumeClaim(session sarama.ConsumerGroupSession, claim sar
 				continue
 			}
 			session.MarkMessage(msg, "")
-			k.Printf("received message with offset: %d\n", msg.Offset)
+			k.Printf(k.config.ClientId+": received message with offset: %d\n", msg.Offset)
 		}
 	}
 }
@@ -204,13 +213,11 @@ func (k *kafkaQueue) Initialize(config *Configuration) error {
 	}
 	k.queue.Resize(config.QueueSize)
 	k.ctx, k.cancel = context.WithCancel(context.Background())
-	if err := k.launchConsumerGroup(config.TopicIn, consumerGroup); err != nil {
-		k.cancel()
-		return err
-	}
 	k.consumerGroup = consumerGroup
 	k.client, k.producer = client, producer
 	k.config = *config
+	k.launchConsumerGroup()
+	<-k.chReadyToConsume
 	k.initialized = true
 	return nil
 }
@@ -221,14 +228,14 @@ func (k *kafkaQueue) Shutdown() {
 	}
 	k.cancel()
 	k.Wait()
+	if err := k.consumerGroup.Close(); err != nil {
+		k.Printf("error while closing consumer group: %s", err)
+	}
 	if items := k.queue.Close(); len(items) > 0 {
 		k.Printf("items in queue, attempting to re-publish")
 		if err := k.publish(items...); err != nil {
 			k.Printf("error while re-publishing in-memory items: %s", err)
 		}
-	}
-	if err := k.consumerGroup.Close(); err != nil {
-		k.Printf("error while closing consumer group: %s", err)
 	}
 	if err := k.producer.Close(); err != nil {
 		k.Printf("error while closing producer: %s", err)
